@@ -1,27 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Power Spike Analyzer — GUI + CLI (single-file edition)
+Power Spike Analyzer — GUI + CLI (single-file edition, HTML reports)
 
-This file combines:
-  • The PowerSentry SD analyzer (voltage/frequency parsing, metrics, plots, reports)
-  • A Tkinter GUI to pick an SD dump folder and run analyses with buttons
+Changes in this build:
+  • Reports are written as .html instead of .md
+  • The "Analyze All" index is index.html with links and inline images
 
-Dependencies (install into your venv):
+Dependencies:
   pip install pandas matplotlib
 
 Run:
-  • GUI (default when no args):  python main.py
-  • CLI (same flags as before):  python main.py --dir <sd_dir> --out <report_dir> [--filter-freq] [--hist]
-                                  or: python main.py --level <BASE>.csv --freq <BASE>F.csv --out <report_dir>
-
-Notes:
-  • The GUI writes all outputs to the chosen output directory.
-  • "Analyze Selected" runs only the highlighted capture in the list.
-  • "Analyze All" processes everything found and writes an index.md with links.
-  • "Open Output Folder" opens the output directory in your OS file browser.
-  • "View Last Report" opens the most recently generated report.
-  • "Quit" exits (obviously).
+  • GUI: python main.py
+  • CLI: python main.py --dir <sd_dir> --out <report_dir> [--filter-freq] [--hist]
 """
 from __future__ import annotations
 
@@ -37,12 +28,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib
-
-# Core deps
 import pandas as pd
 
-matplotlib.use("Agg")  # headless-safe for plotting to files
-# GUI (stdlib)
+matplotlib.use("Agg")
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -65,8 +53,6 @@ F_HARD_MAX = 62.0
 
 @dataclass(frozen=True)
 class SeriesFiles:
-    """Holds discovered file paths for a base capture id."""
-
     base: str
     level_path: Optional[Path]
     freq_path: Optional[Path]
@@ -82,13 +68,11 @@ def _norm_cols(cols: List[str]) -> List[str]:
 
 
 def parse_base_from_filename(p: Path) -> Optional[str]:
-    """Extract 12-digit base from filenames like 090725051139.csv or 090725051139F.csv."""
     m = re.search(r"(\d{12})(?:F)?\.csv$", p.name, flags=re.IGNORECASE)
     return m.group(1) if m else None
 
 
 def parse_base_ts(base: str) -> Optional[datetime]:
-    """Parse MMDDYYhhmmss to datetime (local naive)."""
     try:
         return datetime.strptime(base, "%m%d%y%H%M%S")
     except Exception:
@@ -96,14 +80,6 @@ def parse_base_ts(base: str) -> Optional[datetime]:
 
 
 def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFrame:
-    """
-    Reads a CSV, ignoring '#' comment lines.
-    Normalizes column names.
-    Determines 'value' column automatically if not given.
-    Builds 'ts' column from time_local or filename base + ms.
-
-    Returns a tidy DataFrame with columns ['ts', 'value'], sorted by ts, NaNs dropped.
-    """
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
@@ -113,7 +89,6 @@ def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFr
 
     df.columns = _norm_cols(list(df.columns))
 
-    # Identify value column
     cols = set(df.columns)
     candidates_ordered = []
     if value_guess:
@@ -226,17 +201,11 @@ def voltage_metrics(
     df: pd.DataFrame, v_ok_min: float, v_ok_max: float, v_spike: float
 ) -> Dict[str, float]:
     if df.empty:
-        return {
-            "pct_within_ok_band": math.nan,
-            "spike_count_over_135v": 0,
-        }
+        return {"pct_within_ok_band": math.nan, "spike_count_over_135v": 0}
     v = df["value"].astype(float)
     within = ((v >= v_ok_min) & (v <= v_ok_max)).mean() * 100.0
     spike_count = int((v > v_spike).sum())
-    return {
-        "pct_within_ok_band": float(within),
-        "spike_count_over_135v": spike_count,
-    }
+    return {"pct_within_ok_band": float(within), "spike_count_over_135v": spike_count}
 
 
 def frequency_metrics(
@@ -282,19 +251,13 @@ def frequency_metrics(
 def apply_frequency_isolated_filter(
     df: pd.DataFrame, f_hard_min: float, f_hard_max: float
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    """
-    Drop only isolated out-of-band singletons: keep clusters where a neighbor is also out-of-band.
-    Returns filtered df and counts dict.
-    """
     if df.empty:
         return df.copy(), {"total_out_of_band": 0, "dropped_isolated_singletons": 0}
-
     v = df["value"].astype(float)
     oob = (v < f_hard_min) | (v > f_hard_max)
     prev_oob = oob.shift(1, fill_value=False)
     next_oob = oob.shift(-1, fill_value=False)
     isolated = oob & (~prev_oob) & (~next_oob)
-
     filtered = df.loc[~isolated].reset_index(drop=True)
     counts = {
         "total_out_of_band": int(oob.sum()),
@@ -304,7 +267,6 @@ def apply_frequency_isolated_filter(
 
 
 def parse_device_footers(path: Path) -> Dict[str, str]:
-    """Scan trailing comment lines '# key=value' and return a dict."""
     out: Dict[str, str] = {}
     try:
         with path.open("r", encoding="utf-8") as f:
@@ -333,7 +295,6 @@ def plot_series(df: pd.DataFrame, title: str, ylabel: str, out_png_path: Path) -
         plt.savefig(out_png_path)
         plt.close()
         return
-
     plt.figure()
     plt.plot(df["ts"], df["value"])
     plt.title(title)
@@ -356,7 +317,6 @@ def plot_hist(
         plt.savefig(out_png_path)
         plt.close()
         return
-
     plt.figure()
     plt.hist(df["value"].astype(float).dropna(), bins=bins)
     plt.title(title)
@@ -376,7 +336,7 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
         return str(dt)
 
 
-def _dict_to_markdown_table(d: Dict[str, object]) -> str:
+def _dict_to_html_table(d: Dict[str, object]) -> str:
     keys = list(d.keys())
     preferred = [
         "count",
@@ -394,7 +354,7 @@ def _dict_to_markdown_table(d: Dict[str, object]) -> str:
     seen = set()
     keys_sorted = [k for k in keys_sorted if not (k in seen or seen.add(k))]
 
-    lines = ["| metric | value |", "|---|---|"]
+    rows = []
     for k in keys_sorted:
         v = d.get(k, "")
         if isinstance(v, float) and math.isnan(v):
@@ -405,11 +365,15 @@ def _dict_to_markdown_table(d: Dict[str, object]) -> str:
             s = _fmt_dt(v)
         else:
             s = str(v)
-        lines.append(f"| {k} | {s} |")
-    return "\n".join(lines)
+        rows.append(f"<tr><td>{k}</td><td>{s}</td></tr>")
+    return (
+        "<table><thead><tr><th>metric</th><th>value</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
 
 
-def render_report(
+def render_report_html(
     base: str,
     paths: Dict[str, Optional[Path]],
     stats_level: Optional[Dict[str, object]],
@@ -418,38 +382,51 @@ def render_report(
     figures: Dict[str, Path],
     filtered_extras: Optional[Dict[str, object]] = None,
     footers: Optional[Dict[str, Dict[str, str]]] = None,
-    out_md_path: Optional[Path] = None,
+    out_html_path: Optional[Path] = None,
 ) -> str:
+    def h(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     parts: List[str] = []
-    parts.append(f"# PowerSentry Capture Report — {base}\n")
-    parts.append("## Files\n")
-    parts.append(f"- Level CSV: `{paths.get('level')}`")
-    parts.append(f"- Frequency CSV: `{paths.get('freq')}`\n")
+    parts.append(
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>PowerSentry Capture Report — {h(base)}</title>"
+        "<style>body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;"
+        "line-height:1.45;max-width:980px;margin:24px auto;padding:0 16px;}"
+        "table{border-collapse:collapse;margin:8px 0;}"
+        "td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;}"
+        "h1,h2,h3{margin-top:1.2em;}code{background:#f4f4f4;padding:1px 4px;border-radius:3px;}"
+        "img{max-width:100%;height:auto;border:1px solid #eee;padding:2px;background:#fff;}"
+        ".muted{color:#666;font-size:0.95em}</style></head><body>"
+    )
+    parts.append(f"<h1>PowerSentry Capture Report — {h(base)}</h1>")
+
+    parts.append("<h2>Files</h2><ul>")
+    parts.append(f"<li>Level CSV: <code>{h(str(paths.get('level') or ''))}</code></li>")
+    parts.append(
+        f"<li>Frequency CSV: <code>{h(str(paths.get('freq') or ''))}</code></li>"
+    )
+    parts.append("</ul>")
 
     if stats_level is not None:
-        parts.append("## Voltage summary")
-        parts.append(_dict_to_markdown_table(stats_level))
-        parts.append("")
+        parts.append("<h2>Voltage summary</h2>")
+        parts.append(_dict_to_html_table(stats_level))
         extras_v = extras.get("voltage", {})
         if extras_v:
-            parts.append("### Voltage metrics")
-            parts.append(_dict_to_markdown_table(extras_v))
-            parts.append("")
+            parts.append("<h3>Voltage metrics</h3>")
+            parts.append(_dict_to_html_table(extras_v))
 
     if stats_freq is not None:
-        parts.append("## Frequency summary")
-        parts.append(_dict_to_markdown_table(stats_freq))
-        parts.append("")
+        parts.append("<h2>Frequency summary</h2>")
+        parts.append(_dict_to_html_table(stats_freq))
         extras_f = extras.get("frequency", {})
         if extras_f:
-            parts.append("### Frequency metrics")
-            parts.append(_dict_to_markdown_table(extras_f))
-            parts.append("")
+            parts.append("<h3>Frequency metrics</h3>")
+            parts.append(_dict_to_html_table(extras_f))
 
     if filtered_extras is not None:
-        parts.append("### Filtered frequency view (isolated outliers dropped)")
-        parts.append(_dict_to_markdown_table(filtered_extras))
-        parts.append("")
+        parts.append("<h3>Filtered frequency view (isolated outliers dropped)</h3>")
+        parts.append(_dict_to_html_table(filtered_extras))
 
     if stats_level is not None and "mean" in stats_level:
         mean_v = stats_level.get("mean")
@@ -457,14 +434,13 @@ def render_report(
         rng_v = (stats_level.get("min"), stats_level.get("max"))
         pct_ok = extras.get("voltage", {}).get("pct_within_ok_band")
         spikes = extras.get("voltage", {}).get("spike_count_over_135v")
-        parts.append("## Voltage interpretation")
+        parts.append("<h2>Voltage interpretation</h2>")
         parts.append(
-            f"Average {mean_v:.2f} V with RMS {rms_v:.2f} V. "
+            f"<p>Average {mean_v:.2f} V with RMS {rms_v:.2f} V. "
             f"The range was {rng_v[0]:.2f} to {rng_v[1]:.2f} V. "
             f"About {pct_ok:.1f}% of samples were within {V_OK_MIN:.0f}–{V_OK_MAX:.0f} V. "
-            f"Spike count (> {V_SPIKE:.0f} V): {int(spikes)}."
+            f"Spike count (&gt; {V_SPIKE:.0f} V): {int(spikes)}.</p>"
         )
-        parts.append("")
 
     if stats_freq is not None and "median" in stats_freq:
         median_f = stats_freq.get("median")
@@ -473,43 +449,53 @@ def render_report(
         pct_l = extras.get("frequency", {}).get("pct_within_loose")
         below = extras.get("frequency", {}).get("count_below_58hz")
         above = extras.get("frequency", {}).get("count_above_62hz")
-        tail = ""
-        if filtered_extras is not None:
-            tail = " After dropping isolated outliers, frequency clusters remain close to 60 Hz."
-        parts.append("## Frequency interpretation")
-        parts.append(
-            f"Median {median_f:.3f} Hz. Range {rng_f[0]:.3f} to {rng_f[1]:.3f} Hz. "
-            f"{pct_t:.1f}% within ±{F_TIGHT:.2f} Hz and {pct_l:.1f}% within ±{F_LOOSE:.2f} Hz. "
-            f"Counts outside [{F_HARD_MIN:.0f}, {F_HARD_MAX:.0f}] Hz: below={int(below)}, above={int(above)}.{tail}"
+        tail = (
+            " After dropping isolated outliers, frequency clusters remain close to 60 Hz."
+            if filtered_extras is not None
+            else ""
         )
-        parts.append("")
+        parts.append("<h2>Frequency interpretation</h2>")
+        parts.append(
+            f"<p>Median {median_f:.3f} Hz. Range {rng_f[0]:.3f} to {rng_f[1]:.3f} Hz. "
+            f"{pct_t:.1f}% within ±{F_TIGHT:.2f} Hz and {pct_l:.1f}% within ±{F_LOOSE:.2f} Hz. "
+            f"Counts outside [{F_HARD_MIN:.0f}, {F_HARD_MAX:.0f}] Hz: below={int(below)}, above={int(above)}.{tail}</p>"
+        )
 
-    parts.append("## Plots")
+    parts.append("<h2>Plots</h2>")
     if "voltage_png" in figures:
-        parts.append(f"![Voltage over time]({figures['voltage_png'].name})")
+        parts.append(
+            f"<div><img alt='Voltage over time' src='{figures['voltage_png'].name}'></div>"
+        )
     if "frequency_png" in figures:
-        parts.append(f"![Frequency over time]({figures['frequency_png'].name})")
+        parts.append(
+            f"<div><img alt='Frequency over time' src='{figures['frequency_png'].name}'></div>"
+        )
     if "voltage_hist" in figures:
-        parts.append(f"![Voltage distribution]({figures['voltage_hist'].name})")
+        parts.append(
+            f"<div><img alt='Voltage distribution' src='{figures['voltage_hist'].name}'></div>"
+        )
     if "frequency_hist" in figures:
-        parts.append(f"![Frequency distribution]({figures['frequency_hist'].name})")
-    parts.append("")
+        parts.append(
+            f"<div><img alt='Frequency distribution' src='{figures['frequency_hist'].name}'></div>"
+        )
 
     if footers:
-        parts.append("## Device footers (as-recorded)")
+        parts.append("<h2>Device footers (as-recorded)</h2>")
         for kind, kv in footers.items():
-            parts.append(f"### {kind.title()} footer")
+            parts.append(f"<h3>{kind.title()} footer</h3>")
             if kv:
-                lines = [f"- `{k}` = `{v}`" for k, v in kv.items()]
-                parts.extend(lines)
+                parts.append("<ul>")
+                for k, v in kv.items():
+                    parts.append(f"<li><code>{h(k)}</code> = <code>{h(v)}</code></li>")
+                parts.append("</ul>")
             else:
-                parts.append("_(none)_")
-            parts.append("")
+                parts.append("<p class='muted'>(none)</p>")
 
-    md = "\n".join(parts)
-    if out_md_path:
-        out_md_path.write_text(md, encoding="utf-8")
-    return md
+    parts.append("</body></html>")
+    html = "\n".join(parts)
+    if out_html_path:
+        out_html_path.write_text(html, encoding="utf-8")
+    return html
 
 
 def write_summary_csv(d: Dict[str, object], path: Path) -> None:
@@ -530,10 +516,6 @@ def analyze_pair(
     filter_freq: bool = False,
     make_hist: bool = False,
 ) -> Tuple[bool, Optional[Path]]:
-    """
-    Analyze a pair (or a single file if one is missing).
-    Returns (success, report_path_or_None).
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     have_any = False
@@ -544,7 +526,6 @@ def analyze_pair(
     filtered_extras: Optional[Dict[str, object]] = None
     footers: Dict[str, Dict[str, str]] = {}
 
-    # Level (voltage)
     if level_path and level_path.exists():
         dfL = load_capture_csv(level_path, value_guess="level_v")
         stats_level = compute_basic_stats(dfL)
@@ -565,7 +546,6 @@ def analyze_pair(
         footers["voltage"] = parse_device_footers(level_path)
         have_any = True
 
-    # Frequency
     if freq_path and freq_path.exists():
         dfF = load_capture_csv(freq_path, value_guess="freq_hz")
         dfF = dfF[dfF["value"] > 0].reset_index(drop=True)
@@ -599,8 +579,8 @@ def analyze_pair(
         footers["frequency"] = parse_device_footers(freq_path)
         have_any = True
 
-    report_path = out_dir / f"{base}_report.md"
-    render_report(
+    report_path = out_dir / f"{base}_report.html"
+    render_report_html(
         base=base,
         paths={"level": level_path, "freq": freq_path},
         stats_level=stats_level,
@@ -609,20 +589,17 @@ def analyze_pair(
         figures=figures,
         filtered_extras=filtered_extras,
         footers=footers,
-        out_md_path=report_path,
+        out_html_path=report_path,
     )
 
     return have_any, (report_path if have_any else None)
 
 
 def find_pairs_in_dir(dir_path: Path) -> List[SeriesFiles]:
-    """Discover files in a directory and return a list of SeriesFiles with possible pairs."""
     if not dir_path.exists() or not dir_path.is_dir():
         return []
-
     level_map: Dict[str, Path] = {}
     freq_map: Dict[str, Path] = {}
-
     for p in dir_path.iterdir():
         if p.suffix.lower() != ".csv":
             continue
@@ -635,7 +612,6 @@ def find_pairs_in_dir(dir_path: Path) -> List[SeriesFiles]:
             freq_map[base] = p
         else:
             level_map[base] = p
-
     bases = sorted(set(level_map.keys()) | set(freq_map.keys()))
     out: List[SeriesFiles] = []
     for b in bases:
@@ -646,7 +622,7 @@ def find_pairs_in_dir(dir_path: Path) -> List[SeriesFiles]:
 
 
 # ---------------------------
-# CLI entry
+# CLI
 # ---------------------------
 def main_cli(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
@@ -734,13 +710,11 @@ class AnalyzerGUI(tk.Tk):
         self.geometry("920x600")
         self.minsize(820, 520)
 
-        # State
         self.input_dir: Optional[Path] = None
         self.output_dir: Optional[Path] = None
         self.pairs: List[SeriesFiles] = []
         self.last_report: Optional[Path] = None
 
-        # UI Vars
         self.var_input = tk.StringVar()
         self.var_output = tk.StringVar()
         self.var_filter = tk.BooleanVar(value=True)
@@ -748,14 +722,12 @@ class AnalyzerGUI(tk.Tk):
 
         self._build_widgets()
 
-    # ---------- UI construction ----------
     def _build_widgets(self):
         pad = {"padx": 8, "pady": 6}
 
         top = ttk.Frame(self)
         top.pack(fill="x")
 
-        # Input folder
         ttk.Label(top, text="SD folder:").grid(row=0, column=0, sticky="w", **pad)
         e_in = ttk.Entry(top, textvariable=self.var_input, width=70)
         e_in.grid(row=0, column=1, sticky="we", **pad)
@@ -763,7 +735,6 @@ class AnalyzerGUI(tk.Tk):
             row=0, column=2, **pad
         )
 
-        # Output folder
         ttk.Label(top, text="Output folder:").grid(row=1, column=0, sticky="w", **pad)
         e_out = ttk.Entry(top, textvariable=self.var_output, width=70)
         e_out.grid(row=1, column=1, sticky="we", **pad)
@@ -771,7 +742,6 @@ class AnalyzerGUI(tk.Tk):
             row=1, column=2, **pad
         )
 
-        # Options
         opts = ttk.Frame(self)
         opts.pack(fill="x")
         ttk.Checkbutton(
@@ -781,11 +751,9 @@ class AnalyzerGUI(tk.Tk):
             side="left", **pad
         )
 
-        # Middle split: listbox + actions
         mid = ttk.Frame(self)
         mid.pack(fill="both", expand=True)
 
-        # Listbox for pairs
         left = ttk.Frame(mid)
         left.pack(side="left", fill="both", expand=True, padx=8, pady=6)
         ttk.Label(left, text="Discovered captures:").pack(anchor="w")
@@ -803,7 +771,6 @@ class AnalyzerGUI(tk.Tk):
             side="left", padx=4
         )
 
-        # Right side controls
         right = ttk.Frame(mid)
         right.pack(side="left", fill="y", padx=8, pady=6)
         ttk.Button(right, text="Open Output Folder", command=self._open_output).pack(
@@ -815,17 +782,14 @@ class AnalyzerGUI(tk.Tk):
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=10)
         ttk.Button(right, text="Quit", command=self.destroy).pack(fill="x", pady=4)
 
-        # Log window
         logf = ttk.Frame(self)
         logf.pack(fill="both", expand=True)
         ttk.Label(logf, text="Log:").pack(anchor="w")
         self.log = ScrolledText(logf, height=10, wrap="word")
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        # Make columns stretch
         top.grid_columnconfigure(1, weight=1)
 
-    # ---------- helpers ----------
     def _log(self, msg: str):
         self.log.insert("end", msg + "\n")
         self.log.see("end")
@@ -836,7 +800,6 @@ class AnalyzerGUI(tk.Tk):
         if path:
             self.input_dir = Path(path)
             self.var_input.set(str(self.input_dir))
-            # Default output to <input>/Reports if not set
             if not self.var_output.get():
                 od = self.input_dir / "Reports"
                 self.output_dir = od
@@ -948,23 +911,30 @@ class AnalyzerGUI(tk.Tk):
             self._write_index(processed, out_dir)
 
     def _write_index(self, processed: List[Tuple[str, Optional[Path]]], out_dir: Path):
-        """Create a simple index.md linking to per-capture reports and plots."""
-        lines = [
-            "# PowerSentry Analysis Index",
-            "",
-            f"Total captures: {len(processed)}",
-            "",
+        html = [
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<title>PowerSentry Analysis Index</title>"
+            "<style>body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;"
+            "line-height:1.45;max-width:980px;margin:24px auto;padding:0 16px;}"
+            "a{color:#0645ad;text-decoration:none;}a:hover{text-decoration:underline;}"
+            "img{max-width:100%;height:auto;border:1px solid #eee;padding:2px;background:#fff;}"
+            "h1,h2{margin-top:1.2em;}</style></head><body>"
         ]
+        html.append("<h1>PowerSentry Analysis Index</h1>")
+        html.append(f"<p>Total captures: {len(processed)}</p>")
         for base, rpt in sorted(processed, key=lambda x: x[0]):
             vp = (out_dir / f"{base}_voltage.png").name
             fp = (out_dir / f"{base}_frequency.png").name
-            lines.append(f"## {base}")
+            html.append(f"<h2>{base}</h2>")
             if rpt:
-                lines.append(f"- Report: [{rpt.name}]({rpt.name})")
-            lines.append(f"- Plots: ![{vp}]({vp})  ![{fp}]({fp})")
-            lines.append("")
-        idx = out_dir / "index.md"
-        idx.write_text("\n".join(lines), encoding="utf-8")
+                html.append(f"<p>Report: <a href='{rpt.name}'>{rpt.name}</a></p>")
+            html.append(
+                f"<p>Plots:<br><img alt='Voltage {base}' src='{vp}'> "
+                f"<img alt='Frequency {base}' src='{fp}'></p>"
+            )
+        html.append("</body></html>")
+        idx = out_dir / "index.html"
+        idx.write_text("\n".join(html), encoding="utf-8")
         self._log(f"Wrote index: {idx}")
 
     def _open_output(self):
@@ -998,11 +968,7 @@ def launch_gui():
     app.mainloop()
 
 
-# ---------------------------
-# Entrypoint selection
-# ---------------------------
 if __name__ == "__main__":
-    # If any CLI flags are provided, run CLI. Else launch GUI.
     if len(sys.argv) > 1:
         sys.exit(main_cli())
     else:
