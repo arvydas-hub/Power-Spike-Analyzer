@@ -1,90 +1,53 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-PowerSentry SD Analyzer — ps_analyze.py
+Power Spike Analyzer — GUI + CLI (single-file edition)
 
-Analyzes M5Stack Core2 PowerSentry SD-card captures of AC voltage "level" and frequency.
-Implements the spec agreed with Arvy on 2025-09-08.
+This file combines:
+  • The PowerSentry SD analyzer (voltage/frequency parsing, metrics, plots, reports)
+  • A Tkinter GUI to pick an SD dump folder and run analyses with buttons
 
-Inputs and file conventions
----------------------------
-Accept either:
-  • Two explicit file paths: <BASE>.csv (voltage level) and <BASE>F.csv (frequency), or
-  • A directory path to scan for pairs. The base name is MMDDYYhhmmss.
-    The level file is <BASE>.csv. The frequency file is <BASE>F.csv.
-
-CSV details:
-  • Comment lines start with '#' and should be ignored.
-  • Expected columns per row (case-insensitive, whitespace-tolerant):
-      - time_local (string, local timestamp)
-      - ms (integer, optional)
-      - level_v (float)  for voltage files
-      - freq_hz (float)  for frequency files
-  • Backward compatibility:
-      If time_local is missing, derive a base timestamp from the filename <BASE> interpreted
-      as MMDDYYhhmmss. Use ms to offset inside the event. If ms is missing, treat as zero.
-
-Computations
-------------
-For each series (level and frequency):
-  - samples count
-  - min, max, mean, median, stddev (population)
-  - rms
-  - start, end, and duration_s
-
-Additional metrics for voltage:
-  - Percent of samples within [114.0, 126.0] V (ANSI C84.1 Range A surrogate)
-  - Count of samples > 135.0 V ("spike count")
-
-Additional metrics for frequency:
-  - Percent within 60.00 ± 0.05 Hz
-  - Percent within 60.00 ± 0.20 Hz
-  - Count of samples < 58.0 Hz and > 62.0 Hz
-  - Optional filtered view to mimic device v3.0.6 logic:
-      Mark a sample as out-of-band if value < 58.0 or value > 62.0
-      Drop only isolated out-of-band singletons (keep clusters)
-      Provide filtered-series metrics and counts:
-        • dropped_out_of_band_total
-        • dropped_isolated_singletons
-
-Visuals
--------
-  - Time series line chart for Voltage over time
-  - Time series line chart for Frequency over time
-  - Optional histograms (via --hist)
-
-CLI
----
-  Analyze a pair:
-    python ps_analyze.py --level <path/to/BASE.csv> --freq <path/to/BASEF.csv> --out <report_dir> [--filter-freq] [--hist]
-
-  Analyze a directory (find pairs):
-    python ps_analyze.py --dir <sd_dump_dir> --out <report_dir> [--filter-freq] [--hist]
-
-Outputs
--------
-  <BASE>_voltage_summary.csv
-  <BASE>_frequency_summary.csv
-  <BASE>_voltage.png
-  <BASE>_frequency.png
-  <BASE>_report.md
-
-Requirements
-------------
-  Python 3.9+ recommended
+Dependencies (install into your venv):
   pip install pandas matplotlib
+
+Run:
+  • GUI (default when no args):  python main.py
+  • CLI (same flags as before):  python main.py --dir <sd_dir> --out <report_dir> [--filter-freq] [--hist]
+                                  or: python main.py --level <BASE>.csv --freq <BASE>F.csv --out <report_dir>
+
+Notes:
+  • The GUI writes all outputs to the chosen output directory.
+  • "Analyze Selected" runs only the highlighted capture in the list.
+  • "Analyze All" processes everything found and writes an index.md with links.
+  • "Open Output Folder" opens the output directory in your OS file browser.
+  • "View Last Report" opens the most recently generated report.
+  • "Quit" exits (obviously).
 """
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import matplotlib.pyplot as plt
+import matplotlib
+
+# Core deps
 import pandas as pd
+
+matplotlib.use("Agg")  # headless-safe for plotting to files
+# GUI (stdlib)
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
+
+import matplotlib.pyplot as plt
 
 # ---------------------------
 # Configurable constants
@@ -119,10 +82,7 @@ def _norm_cols(cols: List[str]) -> List[str]:
 
 
 def parse_base_from_filename(p: Path) -> Optional[str]:
-    """
-    Extract 12-digit base from filenames like 090725051139.csv or 090725051139F.csv.
-    Returns None if not matched.
-    """
+    """Extract 12-digit base from filenames like 090725051139.csv or 090725051139F.csv."""
     m = re.search(r"(\d{12})(?:F)?\.csv$", p.name, flags=re.IGNORECASE)
     return m.group(1) if m else None
 
@@ -147,10 +107,8 @@ def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFr
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    # Read CSV with comment lines skipped
     df = pd.read_csv(path, comment="#", dtype=str).copy()
     if df.shape[0] == 0 and df.shape[1] == 0:
-        # Empty after skipping comments
         return pd.DataFrame(columns=["ts", "value"])
 
     df.columns = _norm_cols(list(df.columns))
@@ -160,8 +118,6 @@ def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFr
     candidates_ordered = []
     if value_guess:
         candidates_ordered.append(value_guess.strip().lower())
-
-    # Add common synonyms
     candidates_ordered += [
         "level_v",
         "level",
@@ -178,7 +134,6 @@ def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFr
             value_col = c
             break
     if value_col is None:
-        # Try to heuristically guess: pick first numeric-looking column
         for c in df.columns:
             try:
                 pd.to_numeric(df[c])
@@ -188,25 +143,18 @@ def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFr
                 continue
 
     if value_col is None:
-        # No usable value column
         return pd.DataFrame(columns=["ts", "value"])
 
-    # Parse value as float
     df["value"] = pd.to_numeric(df[value_col], errors="coerce")
 
-    # Build timestamps
     base = parse_base_from_filename(path) or ""
     base_ts = parse_base_ts(base)
 
     ts = None
     if "time_local" in df.columns:
-        # Try multiple formats; if fails, fall back to pandas parser
-        # First pass: direct to_datetime coercion (handles ISO and many formats)
         ts = pd.to_datetime(
             df["time_local"], errors="coerce", infer_datetime_format=True
         )
-
-        # Secondary targeted attempts if many NaT
         if ts.isna().mean() > 0.5:
             fmts = ["%m/%d/%y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m-%d-%y %H:%M:%S"]
             ts_try = None
@@ -221,17 +169,13 @@ def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFr
                     ts = ts_try
                     break
     if ts is None or ts.isna().all():
-        # Fallback: filename base
         if base_ts is not None:
             ts = pd.Series([base_ts] * len(df), index=df.index, dtype="datetime64[ns]")
         else:
-            # Give up: no timestamps
             ts = pd.to_datetime(pd.Series([pd.NaT] * len(df)), errors="coerce")
 
-    # If ms exists, add milliseconds
     if "ms" in df.columns:
         ms = pd.to_numeric(df["ms"], errors="coerce").fillna(0).astype("Int64")
-        # Any missing ts stays NaT after addition
         ts = ts + pd.to_timedelta(ms.fillna(0).astype("float") / 1000.0, unit="s")
 
     out = pd.DataFrame({"ts": ts, "value": df["value"]})
@@ -310,10 +254,8 @@ def frequency_metrics(
             "count_below_58hz": 0,
             "count_above_62hz": 0,
         }
-    # Drop non-positive frequencies for metric computations
     v = df["value"].astype(float)
     v = v[v > 0]
-
     if v.empty:
         return {
             "pct_within_tight": math.nan,
@@ -321,7 +263,6 @@ def frequency_metrics(
             "count_below_58hz": 0,
             "count_above_62hz": 0,
         }
-
     within_tight = (
         (v >= (f_center - tight)) & (v <= (f_center + tight))
     ).mean() * 100.0
@@ -350,7 +291,6 @@ def apply_frequency_isolated_filter(
 
     v = df["value"].astype(float)
     oob = (v < f_hard_min) | (v > f_hard_max)
-    # Isolated if current is oob but neither neighbor is oob
     prev_oob = oob.shift(1, fill_value=False)
     next_oob = oob.shift(-1, fill_value=False)
     isolated = oob & (~prev_oob) & (~next_oob)
@@ -364,21 +304,15 @@ def apply_frequency_isolated_filter(
 
 
 def parse_device_footers(path: Path) -> Dict[str, str]:
-    """
-    Scan trailing comment lines '# key=value' and return a dict.
-    If duplicates exist, the last wins.
-    """
+    """Scan trailing comment lines '# key=value' and return a dict."""
     out: Dict[str, str] = {}
     try:
         with path.open("r", encoding="utf-8") as f:
             lines = f.readlines()
         for line in lines[::-1]:
             if not line.strip().startswith("#"):
-                # stop when we reach non-comment tail
                 break
-            # Remove leading '#'
             txt = line.strip()[1:].strip()
-            # Try key=value
             m = re.match(r"([^=]+)=(.*)$", txt)
             if m:
                 key = m.group(1).strip()
@@ -391,7 +325,6 @@ def parse_device_footers(path: Path) -> Dict[str, str]:
 
 def plot_series(df: pd.DataFrame, title: str, ylabel: str, out_png_path: Path) -> None:
     if df.empty:
-        # Create a tiny placeholder image to avoid broken links
         plt.figure()
         plt.title(title + " (no data)")
         plt.xlabel("Time")
@@ -444,9 +377,7 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
 
 
 def _dict_to_markdown_table(d: Dict[str, object]) -> str:
-    # Keep order stable by sorting keys
     keys = list(d.keys())
-    # Preferred ordering for time fields if present
     preferred = [
         "count",
         "min",
@@ -459,7 +390,6 @@ def _dict_to_markdown_table(d: Dict[str, object]) -> str:
         "end_ts",
         "duration_s",
     ]
-    # Reorder keys so preferred come first
     keys_sorted = preferred + [k for k in keys if k not in preferred]
     seen = set()
     keys_sorted = [k for k in keys_sorted if not (k in seen or seen.add(k))]
@@ -470,7 +400,6 @@ def _dict_to_markdown_table(d: Dict[str, object]) -> str:
         if isinstance(v, float) and math.isnan(v):
             s = ""
         elif isinstance(v, float):
-            # fewer decimals for readability
             s = f"{v:.6g}"
         elif isinstance(v, datetime):
             s = _fmt_dt(v)
@@ -491,17 +420,11 @@ def render_report(
     footers: Optional[Dict[str, Dict[str, str]]] = None,
     out_md_path: Optional[Path] = None,
 ) -> str:
-    """
-    Build a Markdown report string and optionally write it to out_md_path.
-    """
     parts: List[str] = []
     parts.append(f"# PowerSentry Capture Report — {base}\n")
-
-    parts.append("## Files")
-    parts.append("")
+    parts.append("## Files\n")
     parts.append(f"- Level CSV: `{paths.get('level')}`")
-    parts.append(f"- Frequency CSV: `{paths.get('freq')}`")
-    parts.append("")
+    parts.append(f"- Frequency CSV: `{paths.get('freq')}`\n")
 
     if stats_level is not None:
         parts.append("## Voltage summary")
@@ -528,7 +451,6 @@ def render_report(
         parts.append(_dict_to_markdown_table(filtered_extras))
         parts.append("")
 
-    # Interpretation blocks
     if stats_level is not None and "mean" in stats_level:
         mean_v = stats_level.get("mean")
         rms_v = stats_level.get("rms")
@@ -562,7 +484,6 @@ def render_report(
         )
         parts.append("")
 
-    # Figures
     parts.append("## Plots")
     if "voltage_png" in figures:
         parts.append(f"![Voltage over time]({figures['voltage_png'].name})")
@@ -574,7 +495,6 @@ def render_report(
         parts.append(f"![Frequency distribution]({figures['frequency_hist'].name})")
     parts.append("")
 
-    # Footers if any
     if footers:
         parts.append("## Device footers (as-recorded)")
         for kind, kv in footers.items():
@@ -593,11 +513,10 @@ def render_report(
 
 
 def write_summary_csv(d: Dict[str, object], path: Path) -> None:
-    # Convert datetimes to strings
     d2 = {}
     for k, v in d.items():
         if isinstance(v, datetime):
-            d2[k] = _fmt_dt(v)
+            d2[k] = v.strftime("%Y-%m-%d %H:%M:%S")
         else:
             d2[k] = v
     pd.DataFrame([d2]).to_csv(path, index=False)
@@ -610,9 +529,10 @@ def analyze_pair(
     out_dir: Path,
     filter_freq: bool = False,
     make_hist: bool = False,
-) -> bool:
+) -> Tuple[bool, Optional[Path]]:
     """
-    Analyze a pair (or a single file if one is missing). Returns True if at least one analysis succeeded.
+    Analyze a pair (or a single file if one is missing).
+    Returns (success, report_path_or_None).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -648,7 +568,6 @@ def analyze_pair(
     # Frequency
     if freq_path and freq_path.exists():
         dfF = load_capture_csv(freq_path, value_guess="freq_hz")
-        # Drop non-positive frequencies before any stats (per spec)
         dfF = dfF[dfF["value"] > 0].reset_index(drop=True)
         stats_freq = compute_basic_stats(dfF)
         extras["frequency"] = frequency_metrics(
@@ -680,7 +599,6 @@ def analyze_pair(
         footers["frequency"] = parse_device_footers(freq_path)
         have_any = True
 
-    # Report
     report_path = out_dir / f"{base}_report.md"
     render_report(
         base=base,
@@ -694,19 +612,14 @@ def analyze_pair(
         out_md_path=report_path,
     )
 
-    return have_any
+    return have_any, (report_path if have_any else None)
 
 
 def find_pairs_in_dir(dir_path: Path) -> List[SeriesFiles]:
-    """
-    Discover files in a directory and return a list of SeriesFiles with possible pairs.
-    Level: <BASE>.csv
-    Freq:  <BASE>F.csv
-    """
+    """Discover files in a directory and return a list of SeriesFiles with possible pairs."""
     if not dir_path.exists() or not dir_path.is_dir():
         return []
 
-    # Map base -> level/freq paths
     level_map: Dict[str, Path] = {}
     freq_map: Dict[str, Path] = {}
 
@@ -732,7 +645,10 @@ def find_pairs_in_dir(dir_path: Path) -> List[SeriesFiles]:
     return out
 
 
-def main():
+# ---------------------------
+# CLI entry
+# ---------------------------
+def main_cli(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Analyze PowerSentry SD captures for voltage and frequency."
     )
@@ -760,10 +676,9 @@ def main():
         help="Enable filtered frequency view (drop isolated outliers).",
     )
     ap.add_argument("--hist", action="store_true", help="Also generate histograms.")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     out_dir = Path(args.out).expanduser().resolve()
-
     any_success = False
 
     if args.dir:
@@ -771,7 +686,7 @@ def main():
         if not pairs:
             print("No capture files found in directory.")
         for sf in pairs:
-            ok = analyze_pair(
+            ok, _ = analyze_pair(
                 sf.base,
                 sf.level_path,
                 sf.freq_path,
@@ -786,16 +701,14 @@ def main():
             ap.error("--freq is required when --level is used")
         level_path = Path(args.level).expanduser().resolve() if args.level else None
         freq_path = Path(args.freq).expanduser().resolve() if args.freq else None
-        # Base from either path
         base = None
         if level_path:
             base = parse_base_from_filename(level_path)
         if not base and freq_path:
             base = parse_base_from_filename(freq_path)
         if not base:
-            # Fall back to stem sans 'F' if present
             base = (level_path.stem if level_path else freq_path.stem).rstrip("F")
-        ok = analyze_pair(
+        ok, _ = analyze_pair(
             base,
             level_path,
             freq_path,
@@ -807,9 +720,290 @@ def main():
             any_success = True
 
     if not any_success:
-        # Non-zero exit if nothing analyzable
-        raise SystemExit(2)
+        return 2
+    return 0
 
 
+# ---------------------------
+# GUI
+# ---------------------------
+class AnalyzerGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Power Spike Analyzer")
+        self.geometry("920x600")
+        self.minsize(820, 520)
+
+        # State
+        self.input_dir: Optional[Path] = None
+        self.output_dir: Optional[Path] = None
+        self.pairs: List[SeriesFiles] = []
+        self.last_report: Optional[Path] = None
+
+        # UI Vars
+        self.var_input = tk.StringVar()
+        self.var_output = tk.StringVar()
+        self.var_filter = tk.BooleanVar(value=True)
+        self.var_hist = tk.BooleanVar(value=False)
+
+        self._build_widgets()
+
+    # ---------- UI construction ----------
+    def _build_widgets(self):
+        pad = {"padx": 8, "pady": 6}
+
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+
+        # Input folder
+        ttk.Label(top, text="SD folder:").grid(row=0, column=0, sticky="w", **pad)
+        e_in = ttk.Entry(top, textvariable=self.var_input, width=70)
+        e_in.grid(row=0, column=1, sticky="we", **pad)
+        ttk.Button(top, text="Browse…", command=self._choose_input).grid(
+            row=0, column=2, **pad
+        )
+
+        # Output folder
+        ttk.Label(top, text="Output folder:").grid(row=1, column=0, sticky="w", **pad)
+        e_out = ttk.Entry(top, textvariable=self.var_output, width=70)
+        e_out.grid(row=1, column=1, sticky="we", **pad)
+        ttk.Button(top, text="Browse…", command=self._choose_output).grid(
+            row=1, column=2, **pad
+        )
+
+        # Options
+        opts = ttk.Frame(self)
+        opts.pack(fill="x")
+        ttk.Checkbutton(
+            opts, text="Filter freq (drop isolated outliers)", variable=self.var_filter
+        ).pack(side="left", **pad)
+        ttk.Checkbutton(opts, text="Generate histograms", variable=self.var_hist).pack(
+            side="left", **pad
+        )
+
+        # Middle split: listbox + actions
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True)
+
+        # Listbox for pairs
+        left = ttk.Frame(mid)
+        left.pack(side="left", fill="both", expand=True, padx=8, pady=6)
+        ttk.Label(left, text="Discovered captures:").pack(anchor="w")
+        self.listbox = tk.Listbox(left, selectmode="browse")
+        self.listbox.pack(fill="both", expand=True, pady=(0, 6))
+        btns = ttk.Frame(left)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Scan Folder", command=self._scan).pack(
+            side="left", padx=4
+        )
+        ttk.Button(btns, text="Analyze Selected", command=self._analyze_selected).pack(
+            side="left", padx=4
+        )
+        ttk.Button(btns, text="Analyze All", command=self._analyze_all).pack(
+            side="left", padx=4
+        )
+
+        # Right side controls
+        right = ttk.Frame(mid)
+        right.pack(side="left", fill="y", padx=8, pady=6)
+        ttk.Button(right, text="Open Output Folder", command=self._open_output).pack(
+            fill="x", pady=4
+        )
+        ttk.Button(right, text="View Last Report", command=self._open_last_report).pack(
+            fill="x", pady=4
+        )
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Button(right, text="Quit", command=self.destroy).pack(fill="x", pady=4)
+
+        # Log window
+        logf = ttk.Frame(self)
+        logf.pack(fill="both", expand=True)
+        ttk.Label(logf, text="Log:").pack(anchor="w")
+        self.log = ScrolledText(logf, height=10, wrap="word")
+        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # Make columns stretch
+        top.grid_columnconfigure(1, weight=1)
+
+    # ---------- helpers ----------
+    def _log(self, msg: str):
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
+        self.update_idletasks()
+
+    def _choose_input(self):
+        path = filedialog.askdirectory(title="Select SD folder")
+        if path:
+            self.input_dir = Path(path)
+            self.var_input.set(str(self.input_dir))
+            # Default output to <input>/Reports if not set
+            if not self.var_output.get():
+                od = self.input_dir / "Reports"
+                self.output_dir = od
+                self.var_output.set(str(od))
+
+    def _choose_output(self):
+        path = filedialog.askdirectory(title="Select output folder")
+        if path:
+            self.output_dir = Path(path)
+            self.var_output.set(str(self.output_dir))
+
+    def _scan(self):
+        self.listbox.delete(0, "end")
+        self.pairs = []
+        inp = self.var_input.get().strip()
+        if not inp:
+            messagebox.showwarning("Select folder", "Please choose an SD folder first.")
+            return
+        dirp = Path(inp).expanduser().resolve()
+        if not dirp.exists():
+            messagebox.showerror("Folder not found", f"Path does not exist:\n{dirp}")
+            return
+        self._log(f"Scanning {dirp}...")
+        self.pairs = find_pairs_in_dir(dirp)
+        if not self.pairs:
+            self._log("No capture files found (*.csv / *F.csv).")
+            return
+        for sf in self.pairs:
+            flags = []
+            flags.append("L" if sf.level_path and sf.level_path.exists() else "-")
+            flags.append("F" if sf.freq_path and sf.freq_path.exists() else "-")
+            self.listbox.insert("end", f"{sf.base}   [{''.join(flags)}]")
+        self._log(
+            f"Found {len(self.pairs)} capture(s). Select one and click 'Analyze Selected' or use 'Analyze All'."
+        )
+
+    def _ensure_outdir(self) -> Optional[Path]:
+        out = self.var_output.get().strip()
+        if not out:
+            messagebox.showwarning("Select output", "Please choose an output folder.")
+            return None
+        od = Path(out).expanduser().resolve()
+        od.mkdir(parents=True, exist_ok=True)
+        return od
+
+    def _get_selected_pair(self) -> Optional[SeriesFiles]:
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showinfo(
+                "Select a capture", "Please select a capture in the list."
+            )
+            return None
+        idx = sel[0]
+        if idx < 0 or idx >= len(self.pairs):
+            return None
+        return self.pairs[idx]
+
+    def _analyze_selected(self):
+        sf = self._get_selected_pair()
+        if not sf:
+            return
+        out_dir = self._ensure_outdir()
+        if not out_dir:
+            return
+        self._log(f"Analyzing {sf.base}...")
+        ok, rpt = analyze_pair(
+            base=sf.base,
+            level_path=sf.level_path,
+            freq_path=sf.freq_path,
+            out_dir=out_dir,
+            filter_freq=self.var_filter.get(),
+            make_hist=self.var_hist.get(),
+        )
+        if ok:
+            self.last_report = rpt
+            self._log(f"Done: {sf.base} → {rpt}")
+        else:
+            self._log(f"Skipped: {sf.base} (no analyzable files)")
+
+    def _analyze_all(self):
+        if not self.pairs:
+            messagebox.showinfo("Nothing to analyze", "Scan a folder first.")
+            return
+        out_dir = self._ensure_outdir()
+        if not out_dir:
+            return
+        processed: List[Tuple[str, Optional[Path]]] = []
+        self._log(f"Analyzing all {len(self.pairs)} capture(s)...")
+        cnt = 0
+        for sf in self.pairs:
+            ok, rpt = analyze_pair(
+                base=sf.base,
+                level_path=sf.level_path,
+                freq_path=sf.freq_path,
+                out_dir=out_dir,
+                filter_freq=self.var_filter.get(),
+                make_hist=self.var_hist.get(),
+            )
+            if ok:
+                processed.append((sf.base, rpt))
+                self.last_report = rpt
+                cnt += 1
+                self._log(f"  ✔ {sf.base}")
+            else:
+                self._log(f"  – {sf.base} (skipped)")
+            self.update_idletasks()
+        self._log(f"Processed {cnt} / {len(self.pairs)} capture(s).")
+        if processed:
+            self._write_index(processed, out_dir)
+
+    def _write_index(self, processed: List[Tuple[str, Optional[Path]]], out_dir: Path):
+        """Create a simple index.md linking to per-capture reports and plots."""
+        lines = [
+            "# PowerSentry Analysis Index",
+            "",
+            f"Total captures: {len(processed)}",
+            "",
+        ]
+        for base, rpt in sorted(processed, key=lambda x: x[0]):
+            vp = (out_dir / f"{base}_voltage.png").name
+            fp = (out_dir / f"{base}_frequency.png").name
+            lines.append(f"## {base}")
+            if rpt:
+                lines.append(f"- Report: [{rpt.name}]({rpt.name})")
+            lines.append(f"- Plots: ![{vp}]({vp})  ![{fp}]({fp})")
+            lines.append("")
+        idx = out_dir / "index.md"
+        idx.write_text("\n".join(lines), encoding="utf-8")
+        self._log(f"Wrote index: {idx}")
+
+    def _open_output(self):
+        out = self.var_output.get().strip()
+        if not out:
+            messagebox.showinfo("No folder", "Output folder is not set.")
+            return
+        p = Path(out).expanduser().resolve()
+        if sys.platform.startswith("win"):
+            os.startfile(str(p))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+
+    def _open_last_report(self):
+        rpt = self.last_report
+        if not rpt or not rpt.exists():
+            messagebox.showinfo("No report", "No report has been generated yet.")
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(str(rpt))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(rpt)])
+        else:
+            subprocess.Popen(["xdg-open", str(rpt)])
+
+
+def launch_gui():
+    app = AnalyzerGUI()
+    app.mainloop()
+
+
+# ---------------------------
+# Entrypoint selection
+# ---------------------------
 if __name__ == "__main__":
-    main()
+    # If any CLI flags are provided, run CLI. Else launch GUI.
+    if len(sys.argv) > 1:
+        sys.exit(main_cli())
+    else:
+        launch_gui()
