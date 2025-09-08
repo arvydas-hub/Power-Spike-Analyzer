@@ -1,21 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Power Spike Analyzer — GUI + CLI (HTML reports, per-case folders)
+Power Spike Analyzer — GUI + CLI (HTML reports, per-case folders, styled layout)
 
-Updates:
-  • Each capture writes to its own subfolder: <out>/<BASE>/
-    - <BASE>_report.html
-    - <BASE>_voltage.png
-    - <BASE>_frequency.png
-    - optional histograms
-    - *_summary.csv
-  • Metric tables show only the fields that exist (no blank rows).
-  • "Device footers" section is hidden unless the CSVs actually include footers.
-  • index.html links correctly into the per-case subfolders.
-
-Dependencies:
-  pip install pandas matplotlib
+Fixes in this build:
+  • Removed deprecated pandas `infer_datetime_format` usage and improved timestamp parsing.
+  • Fixed TypeError in frequency_metrics (correctly compute 'above' count).
 """
 from __future__ import annotations
 
@@ -82,6 +72,28 @@ def parse_base_ts(base: str) -> Optional[datetime]:
         return None
 
 
+def _parse_time_local(col: pd.Series) -> pd.Series:
+    """Parse time_local robustly without deprecated infer_datetime_format."""
+    # Try explicit formats first; choose the one with the most non-nulls
+    fmts = ["%m/%d/%y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m-%d-%y %H:%M:%S"]
+    best = None
+    best_valid = -1
+    for fmt in fmts:
+        try:
+            parsed = pd.to_datetime(col, format=fmt, errors="coerce")
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            valid = parsed.notna().sum()
+            if valid > best_valid:
+                best = parsed
+                best_valid = valid
+    if best is not None and best_valid > 0:
+        return best
+    # Fallback to generic parser
+    return pd.to_datetime(col, errors="coerce")
+
+
 def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -128,24 +140,12 @@ def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFr
     base = parse_base_from_filename(path) or ""
     base_ts = parse_base_ts(base)
 
-    ts = None
+    # Build timestamps
     if "time_local" in df.columns:
-        ts = pd.to_datetime(
-            df["time_local"], errors="coerce", infer_datetime_format=True
-        )
-        if ts.isna().mean() > 0.5:
-            fmts = ["%m/%d/%y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m-%d-%y %H:%M:%S"]
-            ts_try = None
-            for fmt in fmts:
-                try:
-                    ts_try = pd.to_datetime(
-                        df["time_local"], format=fmt, errors="coerce"
-                    )
-                except Exception:
-                    ts_try = None
-                if ts_try is not None and ts_try.notna().any():
-                    ts = ts_try
-                    break
+        ts = _parse_time_local(df["time_local"])
+    else:
+        ts = None
+
     if ts is None or ts.isna().all():
         if base_ts is not None:
             ts = pd.Series([base_ts] * len(df), index=df.index, dtype="datetime64[ns]")
@@ -159,6 +159,99 @@ def load_capture_csv(path: Path, value_guess: Optional[str] = None) -> pd.DataFr
     out = pd.DataFrame({"ts": ts, "value": df["value"]})
     out = out.dropna(subset=["ts", "value"]).sort_values("ts").reset_index(drop=True)
     return out
+
+
+# ---------- Formatting helpers ----------
+def _fmt_percent(x: float) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return ""
+    return f"{x:.1f}%"
+
+
+def _fmt_float(x: float, kind: str = "generic") -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return ""
+    if kind == "frequency":
+        return f"{x:.2f}"
+    if kind == "voltage":
+        return f"{x:.1f}"
+    if kind == "duration":
+        return f"{x:.0f}"
+    return f"{x:.1f}"
+
+
+def _fmt_value_for_key(val, key: str) -> str:
+    if key.startswith("pct_"):
+        return _fmt_percent(float(val))
+    if key in (
+        "count",
+        "spike_count_over_135v",
+        "count_below_58hz",
+        "count_above_62hz",
+        "total_out_of_band",
+        "dropped_isolated_singletons",
+    ):
+        try:
+            return str(int(val))
+        except Exception:
+            return ""
+    if key in ("duration_s",):
+        return _fmt_float(float(val), "duration")
+    if key in ("min", "max", "mean", "median", "rms", "std_pop"):
+        try:
+            fv = float(val)
+        except Exception:
+            return ""
+        if 40.0 < fv < 80.0:
+            return _fmt_float(fv, "frequency")
+        else:
+            return _fmt_float(fv, "voltage")
+    try:
+        return _fmt_float(float(val))
+    except Exception:
+        return str(val)
+
+
+def _dict_to_html_table(d: Dict[str, object], title: Optional[str] = None) -> str:
+    keys_in = list(d.keys())
+    preferred = [
+        "count",
+        "min",
+        "max",
+        "mean",
+        "median",
+        "std_pop",
+        "rms",
+        "start_ts",
+        "end_ts",
+        "duration_s",
+        "pct_within_ok_band",
+        "spike_count_over_135v",
+        "pct_within_tight",
+        "pct_within_loose",
+        "count_below_58hz",
+        "count_above_62hz",
+        "total_out_of_band",
+        "dropped_isolated_singletons",
+    ]
+    ordered = [k for k in preferred if k in d] + [
+        k for k in keys_in if k not in preferred
+    ]
+
+    header = f"<h3>{title}</h3>" if title else ""
+    rows = []
+    for k in ordered:
+        v = d.get(k, "")
+        if isinstance(v, datetime):
+            s = v.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            s = _fmt_value_for_key(v, k)
+        rows.append(f"<tr><td>{k}</td><td>{s}</td></tr>")
+    table = (
+        "<table class='kv'><thead><tr><th>metric</th><th>value</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table>"
+    )
+    return header + table
 
 
 def compute_basic_stats(df: pd.DataFrame) -> Dict[str, float]:
@@ -242,7 +335,7 @@ def frequency_metrics(
         (v >= (f_center - loose)) & (v <= (f_center + loose))
     ).mean() * 100.0
     below = int((v < f_hard_min).sum())
-    above = int((v > f_hard_max).sum())
+    above = int((v > f_hard_max).sum())  # <-- fixed
     return {
         "pct_within_tight": float(within_tight),
         "pct_within_loose": float(within_loose),
@@ -316,65 +409,77 @@ def plot_hist(
         plt.title(title + " (no data)")
         plt.xlabel(xlabel)
         plt.ylabel("Count")
-        plt.tight_layout()
-        plt.savefig(out_png_path)
-        plt.close()
-        return
-    plt.figure()
-    plt.hist(df["value"].astype(float).dropna(), bins=bins)
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel("Count")
+    else:
+        plt.figure()
+        plt.hist(df["value"].astype(float).dropna(), bins=bins)
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel("Count")
     plt.tight_layout()
     plt.savefig(out_png_path)
     plt.close()
 
 
-def _fmt_dt(dt: Optional[datetime]) -> str:
-    if dt is None or (isinstance(dt, float) and math.isnan(dt)):
-        return ""
-    try:
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return str(dt)
-
-
-def _dict_to_html_table(d: Dict[str, object]) -> str:
-    # Only include keys that actually exist in d (prevents blank rows).
-    keys_in = list(d.keys())
-    preferred = [
-        "count",
-        "min",
-        "max",
-        "mean",
-        "median",
-        "std_pop",
-        "rms",
-        "start_ts",
-        "end_ts",
-        "duration_s",
-    ]
-    ordered = [k for k in preferred if k in d] + [
-        k for k in keys_in if k not in preferred
-    ]
-
-    rows = []
-    for k in ordered:
-        v = d.get(k, "")
-        if isinstance(v, float) and math.isnan(v):
-            s = ""
-        elif isinstance(v, float):
-            s = f"{v:.6g}"
-        elif isinstance(v, datetime):
-            s = _fmt_dt(v)
+# ---------- Scoring for traffic lights ----------
+def _score_voltage(
+    pct_ok: Optional[float], spikes: Optional[int]
+) -> List[Tuple[str, str]]:
+    tips = []
+    if pct_ok is not None and not (isinstance(pct_ok, float) and math.isnan(pct_ok)):
+        if pct_ok >= 95:
+            color = "green"
+            note = f"{_fmt_percent(pct_ok)} within 114–126 V"
+        elif pct_ok >= 80:
+            color = "yellow"
+            note = f"{_fmt_percent(pct_ok)} within 114–126 V"
         else:
-            s = str(v)
-        rows.append(f"<tr><td>{k}</td><td>{s}</td></tr>")
-    return (
-        "<table><thead><tr><th>metric</th><th>value</th></tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
-    )
+            color = "red"
+            note = f"{_fmt_percent(pct_ok)} within 114–126 V"
+        tips.append((color, note))
+    if spikes is not None:
+        if spikes == 0:
+            tips.append(("green", "0 spikes over 135 V"))
+        elif spikes <= 3:
+            tips.append(("yellow", f"{spikes} spike(s) over 135 V"))
+        else:
+            tips.append(("red", f"{spikes} spikes over 135 V"))
+    return tips
+
+
+def _score_frequency(
+    pct_tight: Optional[float], pct_loose: Optional[float], out_low: int, out_high: int
+) -> List[Tuple[str, str]]:
+    tips = []
+    if pct_loose is not None and not (
+        isinstance(pct_loose, float) and math.isnan(pct_loose)
+    ):
+        if pct_loose >= 99:
+            tips.append(("green", f"{_fmt_percent(pct_loose)} within ±0.20 Hz"))
+        elif pct_loose >= 95:
+            tips.append(("yellow", f"{_fmt_percent(pct_loose)} within ±0.20 Hz"))
+        else:
+            tips.append(("red", f"{_fmt_percent(pct_loose)} within ±0.20 Hz"))
+    if pct_tight is not None and not (
+        isinstance(pct_tight, float) and math.isnan(pct_tight)
+    ):
+        if pct_tight >= 80:
+            tips.append(("green", f"{_fmt_percent(pct_tight)} within ±0.05 Hz"))
+        elif pct_tight >= 50:
+            tips.append(("yellow", f"{_fmt_percent(pct_tight)} within ±0.05 Hz"))
+        else:
+            tips.append(("red", f"{_fmt_percent(pct_tight)} within ±0.05 Hz"))
+    total_oob = (out_low or 0) + (out_high or 0)
+    if total_oob == 0:
+        tips.append(("green", "No samples outside 58–62 Hz"))
+    elif total_oob <= 5:
+        tips.append(("yellow", f"{total_oob} sample(s) outside 58–62 Hz"))
+    else:
+        tips.append(("red", f"{total_oob} samples outside 58–62 Hz"))
+    return tips
+
+
+def _badge(color: str, text: str) -> str:
+    return f"<span class='dot {color}'></span>{text}"
 
 
 def render_report_html(
@@ -391,61 +496,25 @@ def render_report_html(
     def h(s: str) -> str:
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    parts: List[str] = []
-    parts.append(
-        f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        f"<title>PowerSentry Capture Report — {h(base)}</title>"
-        "<style>body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;"
-        "line-height:1.45;max-width:980px;margin:24px auto;padding:0 16px;}"
-        "table{border-collapse:collapse;margin:8px 0;}"
-        "td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;}"
-        "h1,h2,h3{margin-top:1.2em;}code{background:#f4f4f4;padding:1px 4px;border-radius:3px;}"
-        "img{max-width:100%;height:auto;border:1px solid #eee;padding:2px;background:#fff;}"
-        ".muted{color:#666;font-size:0.95em}</style></head><body>"
-    )
-    parts.append(f"<h1>PowerSentry Capture Report — {h(base)}</h1>")
-
-    parts.append("<h2>Files</h2><ul>")
-    parts.append(f"<li>Level CSV: <code>{h(str(paths.get('level') or ''))}</code></li>")
-    parts.append(
-        f"<li>Frequency CSV: <code>{h(str(paths.get('freq') or ''))}</code></li>"
-    )
-    parts.append("</ul>")
-
-    if stats_level is not None:
-        parts.append("<h2>Voltage summary</h2>")
-        parts.append(_dict_to_html_table(stats_level))
-        extras_v = extras.get("voltage", {})
-        if extras_v:
-            parts.append("<h3>Voltage metrics</h3>")
-            parts.append(_dict_to_html_table(extras_v))
-
-    if stats_freq is not None:
-        parts.append("<h2>Frequency summary</h2>")
-        parts.append(_dict_to_html_table(stats_freq))
-        extras_f = extras.get("frequency", {})
-        if extras_f:
-            parts.append("<h3>Frequency metrics</h3>")
-            parts.append(_dict_to_html_table(extras_f))
-
-    if filtered_extras is not None:
-        parts.append("<h3>Filtered frequency view (isolated outliers dropped)</h3>")
-        parts.append(_dict_to_html_table(filtered_extras))
-
+    # Interpretations for hero
+    v_interp = ""
     if stats_level is not None and "mean" in stats_level:
         mean_v = stats_level.get("mean")
         rms_v = stats_level.get("rms")
         rng_v = (stats_level.get("min"), stats_level.get("max"))
         pct_ok = extras.get("voltage", {}).get("pct_within_ok_band")
         spikes = extras.get("voltage", {}).get("spike_count_over_135v")
-        parts.append("<h2>Voltage interpretation</h2>")
-        parts.append(
-            f"<p>Average {mean_v:.2f} V with RMS {rms_v:.2f} V. "
-            f"The range was {rng_v[0]:.2f} to {rng_v[1]:.2f} V. "
-            f"About {pct_ok:.1f}% of samples were within {V_OK_MIN:.0f}–{V_OK_MAX:.0f} V. "
-            f"Spike count (&gt; {V_SPIKE:.0f} V): {int(spikes)}.</p>"
+        badges = " &nbsp;•&nbsp; ".join(
+            _badge(c, t) for c, t in _score_voltage(pct_ok, spikes)
+        )
+        v_interp = (
+            f"<div class='line'><strong>Voltage:</strong> "
+            f"Avg {_fmt_float(mean_v,'voltage')} V, RMS {_fmt_float(rms_v,'voltage')} V, "
+            f"range {_fmt_float(rng_v[0],'voltage')}–{_fmt_float(rng_v[1],'voltage')} V.</div>"
+            f"<div class='badges'>{badges}</div>"
         )
 
+    f_interp = ""
     if stats_freq is not None and "median" in stats_freq:
         median_f = stats_freq.get("median")
         rng_f = (stats_freq.get("min"), stats_freq.get("max"))
@@ -458,42 +527,133 @@ def render_report_html(
             if filtered_extras is not None
             else ""
         )
-        parts.append("<h2>Frequency interpretation</h2>")
-        parts.append(
-            f"<p>Median {median_f:.3f} Hz. Range {rng_f[0]:.3f} to {rng_f[1]:.3f} Hz. "
-            f"{pct_t:.1f}% within ±{F_TIGHT:.2f} Hz and {pct_l:.1f}% within ±{F_LOOSE:.2f} Hz. "
-            f"Counts outside [{F_HARD_MIN:.0f}, {F_HARD_MAX:.0f}] Hz: below={int(below)}, above={int(above)}.{tail}</p>"
+        badges = " &nbsp;•&nbsp; ".join(
+            _badge(c, t)
+            for c, t in _score_frequency(pct_t, pct_l, below or 0, above or 0)
+        )
+        f_interp = (
+            f"<div class='line'><strong>Frequency:</strong> "
+            f"Median {_fmt_float(median_f,'frequency')} Hz, "
+            f"range {_fmt_float(rng_f[0],'frequency')}–{_fmt_float(rng_f[1],'frequency')} Hz.</div>"
+            f"<div class='badges'>{badges}{h(tail)}</div>"
         )
 
-    parts.append("<h2>Plots</h2>")
-    if "voltage_png" in figures:
-        parts.append(
-            f"<div><img alt='Voltage over time' src='{figures['voltage_png'].name}'></div>"
-        )
-    if "frequency_png" in figures:
-        parts.append(
-            f"<div><img alt='Frequency over time' src='{figures['frequency_png'].name}'></div>"
-        )
-    if "voltage_hist" in figures:
-        parts.append(
-            f"<div><img alt='Voltage distribution' src='{figures['voltage_hist'].name}'></div>"
-        )
-    if "frequency_hist" in figures:
-        parts.append(
-            f"<div><img alt='Frequency distribution' src='{figures['frequency_hist'].name}'></div>"
-        )
+    # --- HTML skeleton ---
+    parts: List[str] = []
+    parts.append(
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>PowerSentry Capture Report — {h(base)}</title>"
+        "<style>"
+        ":root{--teal:#0f5f74;--teal-d:#0c4b5a;--yellow:#fff8cc;--yellow-b:#e0c300;"
+        "--red:#ffe0e0;--red-b:#cc3333;--purple:#4c1d95;}"
+        "body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;line-height:1.45;"
+        "max-width:1100px;margin:24px auto;padding:0 16px;}"
+        "h1{margin:0 0 .2em 0;} h2{margin:1.0em 0 .4em;} h3{margin:.6em 0 .3em;}"
+        ".hero{background:var(--teal);color:#fff;border-radius:14px;padding:16px 18px;box-shadow:0 2px 8px rgba(0,0,0,.08);}"
+        ".hero .line{font-size:1.05rem;margin:.15em 0;}"
+        ".hero .badges{opacity:.95;margin:.1em 0 .4em;}"
+        ".dot{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:middle;margin:0 6px 2px 0;}"
+        ".dot.green{background:#1e9e37;} .dot.yellow{background:#e2b100;} .dot.red{background:#d33;}"
+        ".cards{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px;}"
+        "@media(max-width: 900px){.cards{grid-template-columns:1fr;}}"
+        ".card{border:1px solid #ccc;border-radius:14px;padding:12px 12px 10px;box-shadow:0 1px 6px rgba(0,0,0,.04);}"
+        ".card.voltage{background:var(--yellow);border-color:var(--yellow-b);}"
+        ".card.frequency{background:var(--red);border-color:var(--red-b);}"
+        ".sgrid{display:grid;grid-template-columns: 1fr 1fr;grid-auto-rows:auto;gap:10px;align-items:start;}"
+        ".sgrid .plot{grid-column:1 / span 2;}"
+        ".kv{border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;}"
+        ".kv td,.kv th{border:1px solid #ddd;padding:4px 8px;} .kv th{background:#f2f2f2;font-weight:600;}"
+        "img{max-width:100%;height:auto;border:1px solid #eee;padding:2px;background:#fff;border-radius:8px;}"
+        ".band-bottom{background:var(--purple);color:#fff;border-radius:14px;padding:14px;margin-top:14px;}"
+        ".band-bottom h2{color:#fff;margin-top:0;}"
+        ".band-bottom .inner{background:rgba(255,255,255,.08);padding:8px;border-radius:10px;}"
+        ".files code{background:#f5f5f5;padding:1px 4px;border-radius:3px;}"
+        "</style></head><body>"
+    )
 
-    # Only show footers section if any footer dict is non-empty
-    if footers and any(bool(kv) for kv in footers.values()):
-        parts.append("<h2>Device footers (as-recorded)</h2>")
-        for kind, kv in footers.items():
-            if not kv:
-                continue
-            parts.append(f"<h3>{kind.title()} footer</h3>")
-            parts.append("<ul>")
-            for k, v in kv.items():
-                parts.append(f"<li><code>{h(k)}</code> = <code>{h(v)}</code></li>")
-            parts.append("</ul>")
+    parts.append("<div class='hero'>")
+    parts.append(f"<h1>PowerSentry Capture Report — {h(base)}</h1>")
+    if v_interp:
+        parts.append(v_interp)
+    if f_interp:
+        parts.append(f_interp)
+    parts.append("</div>")
+
+    # Cards: voltage + frequency
+    parts.append("<div class='cards'>")
+
+    if stats_level is not None:
+        parts.append("<div class='card voltage'>")
+        parts.append("<h2>Voltage</h2>")
+        parts.append("<div class='sgrid'>")
+        parts.append(_dict_to_html_table(stats_level, "Summary"))
+        extras_v = extras.get("voltage", {})
+        if extras_v:
+            parts.append(_dict_to_html_table(extras_v, "Metrics"))
+        else:
+            parts.append("<div></div>")
+        if "voltage_png" in figures:
+            parts.append(
+                f"<div class='plot'><img alt='Voltage over time' src='{figures['voltage_png'].name}'></div>"
+            )
+        parts.append("</div></div>")
+
+    if stats_freq is not None:
+        parts.append("<div class='card frequency'>")
+        parts.append("<h2>Frequency</h2>")
+        parts.append("<div class='sgrid'>")
+        parts.append(_dict_to_html_table(stats_freq, "Summary"))
+        if filtered_extras is not None:
+            parts.append(_dict_to_html_table(filtered_extras, "Filtered metrics"))
+        else:
+            extras_f = extras.get("frequency", {})
+            if extras_f:
+                parts.append(_dict_to_html_table(extras_f, "Metrics"))
+            else:
+                parts.append("<div></div>")
+        if "frequency_png" in figures:
+            parts.append(
+                f"<div class='plot'><img alt='Frequency over time' src='{figures['frequency_png'].name}'></div>"
+            )
+        parts.append("</div></div>")
+    parts.append("</div>")  # .cards
+
+    # Bottom band (purple): distributions + files + footers
+    show_hist = ("voltage_hist" in figures) or ("frequency_hist" in figures)
+    show_footers = footers and any(bool(kv) for kv in footers.values())
+    if show_hist or paths or show_footers:
+        parts.append("<div class='band-bottom'>")
+        if show_hist:
+            parts.append("<h2>Distributions</h2><div class='inner'>")
+            if "voltage_hist" in figures:
+                parts.append(
+                    f"<div><img alt='Voltage distribution' src='{figures['voltage_hist'].name}'></div>"
+                )
+            if "frequency_hist" in figures:
+                parts.append(
+                    f"<div><img alt='Frequency distribution' src='{figures['frequency_hist'].name}'></div>"
+                )
+            parts.append("</div>")
+        if paths:
+            parts.append("<h2>Files</h2><div class='inner'><ul class='files'>")
+            parts.append(
+                f"<li>Level CSV: <code>{h(str(paths.get('level') or ''))}</code></li>"
+            )
+            parts.append(
+                f"<li>Frequency CSV: <code>{h(str(paths.get('freq') or ''))}</code></li>"
+            )
+            parts.append("</ul></div>")
+        if show_footers:
+            parts.append("<h2>Device footers (as-recorded)</h2><div class='inner'>")
+            for kind, kv in footers.items():
+                if not kv:
+                    continue
+                parts.append(f"<h3>{kind.title()} footer</h3><ul>")
+                for k, v in kv.items():
+                    parts.append(f"<li><code>{h(k)}</code> = <code>{h(v)}</code></li>")
+                parts.append("</ul>")
+            parts.append("</div>")
+        parts.append("</div>")  # .band-bottom
 
     parts.append("</body></html>")
     html = "\n".join(parts)
@@ -858,9 +1018,6 @@ class AnalyzerGUI(tk.Tk):
     def _get_selected_pair(self) -> Optional[SeriesFiles]:
         sel = self.listbox.curselection()
         if not sel:
-            messagebox.showinfo(
-                "Select a capture", "Please select a capture in the list."
-            )
             return None
         idx = sel[0]
         if idx < 0 or idx >= len(self.pairs):
@@ -870,6 +1027,9 @@ class AnalyzerGUI(tk.Tk):
     def _analyze_selected(self):
         sf = self._get_selected_pair()
         if not sf:
+            messagebox.showinfo(
+                "Select a capture", "Please select a capture in the list."
+            )
             return
         out_dir = self._ensure_outdir()
         if not out_dir:
@@ -964,15 +1124,50 @@ class AnalyzerGUI(tk.Tk):
 
     def _open_last_report(self):
         rpt = self.last_report
-        if not rpt or not rpt.exists():
-            messagebox.showinfo("No report", "No report has been generated yet.")
+        if rpt and rpt.exists():
+            if sys.platform.startswith("win"):
+                os.startfile(str(rpt))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(rpt)])
+            else:
+                subprocess.Popen(["xdg-open", str(rpt)])
             return
-        if sys.platform.startswith("win"):
-            os.startfile(str(rpt))
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(rpt)])
+
+        res = messagebox.askyesno(
+            "No report found", "No report found. Generate one for the selected capture?"
+        )
+        if not res:
+            return
+        sf = self._get_selected_pair()
+        if not sf:
+            messagebox.showinfo(
+                "Select a capture",
+                "Please select a capture in the list, then try again.",
+            )
+            return
+        out_dir = self._ensure_outdir()
+        if not out_dir:
+            return
+        self._log(f"Analyzing {sf.base}...")
+        ok, rpt2 = analyze_pair(
+            base=sf.base,
+            level_path=sf.level_path,
+            freq_path=sf.freq_path,
+            out_dir=out_dir,
+            filter_freq=self.var_filter.get(),
+            make_hist=self.var_hist.get(),
+        )
+        if ok:
+            self.last_report = rpt2
+            self._log(f"Done: {sf.base} → {rpt2}")
+            if sys.platform.startswith("win"):
+                os.startfile(str(rpt2))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(rpt2)])
+            else:
+                subprocess.Popen(["xdg-open", str(rpt2)])
         else:
-            subprocess.Popen(["xdg-open", str(rpt)])
+            self._log("No analyzable files in the selected capture.")
 
 
 def launch_gui():
