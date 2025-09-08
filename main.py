@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Power Spike Analyzer — GUI + CLI (single-file edition, HTML reports)
+Power Spike Analyzer — GUI + CLI (HTML reports, per-case folders)
 
-Changes in this build:
-  • Reports are written as .html instead of .md
-  • The "Analyze All" index is index.html with links and inline images
+Updates:
+  • Each capture writes to its own subfolder: <out>/<BASE>/
+    - <BASE>_report.html
+    - <BASE>_voltage.png
+    - <BASE>_frequency.png
+    - optional histograms
+    - *_summary.csv
+  • Metric tables show only the fields that exist (no blank rows).
+  • "Device footers" section is hidden unless the CSVs actually include footers.
+  • index.html links correctly into the per-case subfolders.
 
 Dependencies:
   pip install pandas matplotlib
-
-Run:
-  • GUI: python main.py
-  • CLI: python main.py --dir <sd_dir> --out <report_dir> [--filter-freq] [--hist]
 """
 from __future__ import annotations
 
@@ -337,7 +340,8 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
 
 
 def _dict_to_html_table(d: Dict[str, object]) -> str:
-    keys = list(d.keys())
+    # Only include keys that actually exist in d (prevents blank rows).
+    keys_in = list(d.keys())
     preferred = [
         "count",
         "min",
@@ -350,12 +354,12 @@ def _dict_to_html_table(d: Dict[str, object]) -> str:
         "end_ts",
         "duration_s",
     ]
-    keys_sorted = preferred + [k for k in keys if k not in preferred]
-    seen = set()
-    keys_sorted = [k for k in keys_sorted if not (k in seen or seen.add(k))]
+    ordered = [k for k in preferred if k in d] + [
+        k for k in keys_in if k not in preferred
+    ]
 
     rows = []
-    for k in keys_sorted:
+    for k in ordered:
         v = d.get(k, "")
         if isinstance(v, float) and math.isnan(v):
             s = ""
@@ -479,17 +483,17 @@ def render_report_html(
             f"<div><img alt='Frequency distribution' src='{figures['frequency_hist'].name}'></div>"
         )
 
-    if footers:
+    # Only show footers section if any footer dict is non-empty
+    if footers and any(bool(kv) for kv in footers.values()):
         parts.append("<h2>Device footers (as-recorded)</h2>")
         for kind, kv in footers.items():
+            if not kv:
+                continue
             parts.append(f"<h3>{kind.title()} footer</h3>")
-            if kv:
-                parts.append("<ul>")
-                for k, v in kv.items():
-                    parts.append(f"<li><code>{h(k)}</code> = <code>{h(v)}</code></li>")
-                parts.append("</ul>")
-            else:
-                parts.append("<p class='muted'>(none)</p>")
+            parts.append("<ul>")
+            for k, v in kv.items():
+                parts.append(f"<li><code>{h(k)}</code> = <code>{h(v)}</code></li>")
+            parts.append("</ul>")
 
     parts.append("</body></html>")
     html = "\n".join(parts)
@@ -516,7 +520,9 @@ def analyze_pair(
     filter_freq: bool = False,
     make_hist: bool = False,
 ) -> Tuple[bool, Optional[Path]]:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Per-case subfolder
+    case_dir = out_dir / base
+    case_dir.mkdir(parents=True, exist_ok=True)
 
     have_any = False
     figures: Dict[str, Path] = {}
@@ -526,26 +532,28 @@ def analyze_pair(
     filtered_extras: Optional[Dict[str, object]] = None
     footers: Dict[str, Dict[str, str]] = {}
 
+    # Level (voltage)
     if level_path and level_path.exists():
         dfL = load_capture_csv(level_path, value_guess="level_v")
         stats_level = compute_basic_stats(dfL)
         extras["voltage"] = voltage_metrics(dfL, V_OK_MIN, V_OK_MAX, V_SPIKE)
 
-        v_png = out_dir / f"{base}_voltage.png"
+        v_png = case_dir / f"{base}_voltage.png"
         plot_series(dfL, f"Voltage (V) over time — {base}", "Voltage (V)", v_png)
         figures["voltage_png"] = v_png
 
         if make_hist:
-            v_hist = out_dir / f"{base}_voltage_hist.png"
+            v_hist = case_dir / f"{base}_voltage_hist.png"
             plot_hist(dfL, f"Voltage distribution — {base}", "Voltage (V)", v_hist)
             figures["voltage_hist"] = v_hist
 
-        v_sum = out_dir / f"{base}_voltage_summary.csv"
+        v_sum = case_dir / f"{base}_voltage_summary.csv"
         write_summary_csv({**stats_level, **extras["voltage"]}, v_sum)
 
         footers["voltage"] = parse_device_footers(level_path)
         have_any = True
 
+    # Frequency
     if freq_path and freq_path.exists():
         dfF = load_capture_csv(freq_path, value_guess="freq_hz")
         dfF = dfF[dfF["value"] > 0].reset_index(drop=True)
@@ -564,29 +572,31 @@ def analyze_pair(
             )
             filtered_extras = {**stats_freq_filt, **extras_filt, **filt_counts}
 
-        f_png = out_dir / f"{base}_frequency.png"
+        f_png = case_dir / f"{base}_frequency.png"
         plot_series(dfF, f"Frequency (Hz) over time — {base}", "Frequency (Hz)", f_png)
         figures["frequency_png"] = f_png
 
         if make_hist:
-            f_hist = out_dir / f"{base}_frequency_hist.png"
+            f_hist = case_dir / f"{base}_frequency_hist.png"
             plot_hist(dfF, f"Frequency distribution — {base}", "Frequency (Hz)", f_hist)
             figures["frequency_hist"] = f_hist
 
-        f_sum = out_dir / f"{base}_frequency_summary.csv"
+        f_sum = case_dir / f"{base}_frequency_summary.csv"
         write_summary_csv({**stats_freq, **extras["frequency"]}, f_sum)
 
         footers["frequency"] = parse_device_footers(freq_path)
         have_any = True
 
-    report_path = out_dir / f"{base}_report.html"
+    report_path = case_dir / f"{base}_report.html"
     render_report_html(
         base=base,
         paths={"level": level_path, "freq": freq_path},
         stats_level=stats_level,
         stats_freq=stats_freq,
         extras=extras,
-        figures=figures,
+        figures={
+            k: Path(v.name) for k, v in figures.items()
+        },  # images referenced by filename only
         filtered_extras=filtered_extras,
         footers=footers,
         out_html_path=report_path,
@@ -923,11 +933,13 @@ class AnalyzerGUI(tk.Tk):
         html.append("<h1>PowerSentry Analysis Index</h1>")
         html.append(f"<p>Total captures: {len(processed)}</p>")
         for base, rpt in sorted(processed, key=lambda x: x[0]):
-            vp = (out_dir / f"{base}_voltage.png").name
-            fp = (out_dir / f"{base}_frequency.png").name
+            sub = f"{base}/"
+            rpt_href = f"{sub}{base}_report.html" if rpt else ""
+            vp = f"{sub}{base}_voltage.png"
+            fp = f"{sub}{base}_frequency.png"
             html.append(f"<h2>{base}</h2>")
             if rpt:
-                html.append(f"<p>Report: <a href='{rpt.name}'>{rpt.name}</a></p>")
+                html.append(f"<p>Report: <a href='{rpt_href}'>{rpt_href}</a></p>")
             html.append(
                 f"<p>Plots:<br><img alt='Voltage {base}' src='{vp}'> "
                 f"<img alt='Frequency {base}' src='{fp}'></p>"
